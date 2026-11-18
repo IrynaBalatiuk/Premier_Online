@@ -56,5 +56,6 @@ export class RegistrationPage extends BasePage {
 
     async confirmAccountCreation() {
         await this.click(this.continueButton, 'Continue button');
+        
     }
 }
