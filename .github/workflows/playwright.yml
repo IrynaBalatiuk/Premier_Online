@@ -234,17 +234,31 @@ jobs:
             blocks.push({ type: "section", text: { type: "mrkdwn", text: "*:snail: Slowest tests:*\n" + lines.join("\n") } });
           }
  
+          const [owner, repo] = e.REPO.split("/");
+          const allureUrl = `https://${owner}.github.io/${repo}/`;
+
           blocks.push({
-            type: "actions",
-            elements: [
-              {
-                type: "button",
-                text: { type: "plain_text", text: "Open run (HTML report & traces)" },
-                url: e.RUN_URL,
-                style: ok ? "primary" : "danger",
-              },
-            ],
-          });
+           type: "actions",
+           elements: [
+            {
+               type: "button",
+               text: {
+                  type: "plain_text",
+                  text: "Open GitHub Run"
+               },
+            url: e.RUN_URL,
+               },
+                 {
+                   type: "button",
+                     text: {
+                   type: "plain_text",
+                   text: "Open Allure Report"
+                    },
+                     url: allureUrl,
+                     style: ok ? "primary" : "danger",
+                     },
+                   ],
+               });
  
           const payload = {
             text: `Playwright ${status}: ${e.REPO}`,
