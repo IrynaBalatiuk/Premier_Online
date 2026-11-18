@@ -55,6 +55,7 @@ test.describe('Register to account', () => {
              await expect (registrationPage.lastNameField).toHaveValue(signupData.lastName)
              await expect (registrationPage.passwordField).toHaveValue(signupData.password)
              await expect (registrationPage.passwordRepeatField).toHaveValue(signupData.password)    
+             //test update
             })
          
             await test.step('Confirm account creation', async () => {
