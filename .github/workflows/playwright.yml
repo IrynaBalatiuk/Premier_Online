@@ -19,6 +19,8 @@ concurrency:
  
 permissions:
   contents: read
+  pages: write
+  id-token: write
  
 jobs:
   e2e:
@@ -58,10 +60,29 @@ jobs:
           mkdir -p reports
           if [ -n "$GREP" ]; then GREP_ARG="--grep=$GREP"; else GREP_ARG=""; fi
           npx playwright test \
-            --reporter=list,html,json,junit \
+            --reporter=list,html,json,junit,allure-playwright \
             --retries=2 \
             $GREP_ARG
- 
+
+       # ---------- Генерація Allure звіту ----------
+
+      - name: Generate Allure Report
+        if: always()
+        run: |
+          if [ -d allure-results ] && [ -n "$(ls -A allure-results)" ]; then
+            npx allure generate allure-results -o allure-report
+          else
+            echo "No Allure results found"
+          fi
+
+      - name: Upload generated Allure Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report/
+          if-no-files-found: ignore
+
       # ---------- Збір детального звіту (Node.js) ----------
       - name: Build report
         id: report
@@ -293,3 +314,32 @@ jobs:
         run: |
           echo "Failed: ${{ steps.report.outputs.failed }} of ${{ steps.report.outputs.total }}"
           exit 1
+          
+         # ---------- Deploy Allure to GitHub Pages ----------
+  deploy-allure:
+    needs: e2e
+    if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Download Allure Report
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: allure-report
+
+      - name: Deploy Allure Report
+        id: deployment
+        uses: actions/deploy-pages@v4
