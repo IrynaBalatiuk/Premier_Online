@@ -1,6 +1,6 @@
-import { expect, test } from '@playwright/test';
-import { SignupPage } from '../pages/signup';
-import { signupData as data } from '../config/signup_data';
+import { expect, test } from '../fixtures';
+import { SignupPage } from '../../pages/event-creator-registation';
+import { signupData as data } from '../../config/signup_data';
 
 test.describe('Dashboard signup', () => {
     test('displays and fills the signup form', async ({ page }) => {

@@ -1,4 +1,5 @@
 import { Locator, expect, Page } from '@playwright/test';
+import { BasePage } from './base_page';
 
 
 export interface RegistrationData {
@@ -9,7 +10,7 @@ export interface RegistrationData {
     passwordRepeat?: string;
 }
 
-export class RegistrationPage {
+export class RegistrationPage extends BasePage {
     readonly accountButton: Locator;
     readonly emailField: Locator;
     readonly firstNameField: Locator;
@@ -22,6 +23,7 @@ export class RegistrationPage {
     readonly accountCreationSuccessMessage: Locator;
 
     constructor(readonly page: Page) {
+        super(page);
         this.accountButton = page.getByRole('button', { name: 'Create Account', exact: true });
         this.emailField = page.locator('#email');
         this.firstNameField = page.locator('#first_name');
@@ -34,22 +36,25 @@ export class RegistrationPage {
         this.accountCreationSuccessMessage = page.locator('.uk-alert-success');
     }
 
-    async openRegistrationPage() {
-        await expect(this.accountButton).toBeVisible();
-        await this.accountButton.click();
-        await expect(this.page).toHaveURL('https://www.premieronline.com/action/register');
+        async openRegistrationPage() {
+        
+        await this.click(this.accountButton, 'Create Account button');
+        await this.expectUrl('https://www.premieronline.com/action/register');
+       
 
     }
-
     async fillRegistrationForm(data: RegistrationData) {
-        await this.emailField.fill(data.email);
-        await this.firstNameField.fill(data.firstName);
-        await this.lastNameField.fill(data.lastName);
-        await this.passwordField.fill(data.password);
-        await this.passwordRepeatField.fill(data.passwordRepeat ?? data.password);
+
+        await this.fill(this.emailField, data.email, 'Email field');
+        await this.fill(this.firstNameField, data.firstName, 'First Name field');
+        await this.fill(this.lastNameField, data.lastName, 'Last Name field');
+        await this.fill(this.passwordField, data.password, 'Password field');
+        await this.fill(this.passwordRepeatField, data.passwordRepeat ?? data.password, 'Repeat Password field');
+
+
     }
 
     async confirmAccountCreation() {
-        await this.continueButton.click();
+        await this.click(this.continueButton, 'Continue button');
     }
 }

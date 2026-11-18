@@ -1,27 +1,295 @@
-name: Playwright Tests
+name: Playwright Tests & Slack Report
+ 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
   pull_request:
-    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      grep:
+        description: "Запустити лише тести за патерном (--grep), напр. @smoke"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 6 * * 1-5"   # щодня о 06:00 UTC у будні
+ 
+concurrency:
+  group: playwright-${{ github.ref }}
+  cancel-in-progress: true
+ 
+permissions:
+  contents: read
+ 
 jobs:
-  test:
-    timeout-minutes: 60
+  e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      CI: "true"
+ 
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-node@v4
-      with:
-        node-version: lts/*
-    - name: Install dependencies
-      run: npm ci
-    - name: Install Playwright Browsers
-      run: npx playwright install --with-deps
-    - name: Run Playwright tests
-      run: npx playwright test
-    - uses: actions/upload-artifact@v4
-      if: ${{ !cancelled() }}
-      with:
-        name: playwright-report
-        path: playwright-report/
-        retention-days: 30
+      - name: Checkout
+        uses: actions/checkout@v4
+ 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+ 
+      - name: Install dependencies
+        run: npm ci
+ 
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+ 
+      # ---------- Запуск тестів ----------
+      - name: Run Playwright tests
+        id: pw
+        continue-on-error: true   # щоб звіт і Slack відправились навіть при падінні
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: reports/results.json
+          PLAYWRIGHT_JUNIT_OUTPUT_NAME: reports/junit.xml
+          PLAYWRIGHT_HTML_REPORT: playwright-report
+          PLAYWRIGHT_HTML_OPEN: never
+          GREP: ${{ github.event.inputs.grep }}
+        run: |
+          mkdir -p reports
+          if [ -n "$GREP" ]; then GREP_ARG="--grep=$GREP"; else GREP_ARG=""; fi
+          npx playwright test \
+            --reporter=list,html,json,junit \
+            --retries=2 \
+            $GREP_ARG
+ 
+      # ---------- Збір детального звіту (Node.js) ----------
+      - name: Build report
+        id: report
+        if: always()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message || github.event.pull_request.title || '' }}
+        run: |
+          node - <<'JS'
+          const fs = require("fs");
+          const e = process.env;
+          const ANSI = /\x1b\[[0-9;]*m/g;
+ 
+          const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          const cut = (s, n) => {
+            s = String(s || "").replace(ANSI, "").replace(/\s+/g, " ").trim();
+            return s.length <= n ? s : s.slice(0, n - 1) + "…";
+          };
+ 
+          const failed = [];
+          const flaky = [];
+          const slow = [];
+          const byProject = {};
+          let stats = { expected: 0, unexpected: 0, flaky: 0, skipped: 0, duration: 0 };
+ 
+          const proj = (name) =>
+            (byProject[name] ||= { passed: 0, failed: 0, flaky: 0, skipped: 0 });
+ 
+          function walk(suite, fileHint = "") {
+            const file = suite.file || fileHint;
+            for (const spec of suite.specs || []) {
+              for (const t of spec.tests || []) {
+                const p = t.projectName || "default";
+                const title = `[${p}] ${file}: ${spec.title}`;
+                const results = t.results || [];
+                const dur = results.reduce((a, r) => a + (r.duration || 0), 0);
+                slow.push([dur, title]);
+ 
+                switch (t.status) {
+                  case "expected":
+                    proj(p).passed++;
+                    break;
+                  case "skipped":
+                    proj(p).skipped++;
+                    break;
+                  case "flaky":
+                    proj(p).flaky++;
+                    flaky.push([title, results.length - 1]);
+                    break;
+                  case "unexpected": {
+                    proj(p).failed++;
+                    const last = results[results.length - 1] || {};
+                    const err = (last.error && last.error.message) || "";
+                    failed.push([title, err, results.length - 1]);
+                    break;
+                  }
+                }
+              }
+            }
+            for (const child of suite.suites || []) walk(child, file);
+          }
+ 
+          const path = "reports/results.json";
+          if (fs.existsSync(path)) {
+            const data = JSON.parse(fs.readFileSync(path, "utf8"));
+            stats = { ...stats, ...(data.stats || {}) };
+            for (const s of data.suites || []) walk(s);
+          }
+ 
+          const passed = stats.expected;
+          const nFailed = stats.unexpected;
+          const nFlaky = stats.flaky;
+          const nSkipped = stats.skipped;
+          const total = passed + nFailed + nFlaky + nSkipped;
+          const durS = stats.duration / 1000;
+          const ok = nFailed === 0 && total > 0;
+          const clean = ok && nFlaky === 0;
+          const rate = total ? ((passed + nFlaky) / total) * 100 : 0;
+ 
+          const status = clean ? "PASSED" : ok ? "PASSED (flaky)" : total === 0 ? "NO TESTS" : "FAILED";
+          const color = clean ? "#2eb67d" : ok ? "#ecb22e" : "#e01e5a";
+          const icon = clean ? "✅" : ok ? "⚠️" : "❌";
+          const durText = `${Math.floor(durS / 60)}m ${Math.floor(durS % 60)}s`;
+ 
+          // ---------- Slack Block Kit ----------
+          const blocks = [
+            { type: "header", text: { type: "plain_text", text: `${icon} Playwright ${status} — ${e.REPO}` } },
+            {
+              type: "section",
+              fields: [
+                { type: "mrkdwn", text: `*Branch:*\n\`${esc(e.BRANCH)}\`` },
+                { type: "mrkdwn", text: `*Trigger:*\n${e.EVENT} by ${esc(e.ACTOR)}` },
+                { type: "mrkdwn", text: `*Commit:*\n\`${e.SHA.slice(0, 7)}\`` },
+                { type: "mrkdwn", text: `*Duration:*\n${durText}` },
+              ],
+            },
+            {
+              type: "section",
+              fields: [
+                { type: "mrkdwn", text: `*:white_check_mark: Passed:*\n${passed}` },
+                { type: "mrkdwn", text: `*:x: Failed:*\n${nFailed}` },
+                { type: "mrkdwn", text: `*:warning: Flaky:*\n${nFlaky}` },
+                { type: "mrkdwn", text: `*:fast_forward: Skipped:*\n${nSkipped}` },
+              ],
+            },
+            {
+              type: "context",
+              elements: [{ type: "mrkdwn", text: `:bar_chart: Total *${total}* · Pass rate *${rate.toFixed(1)}%*` }],
+            },
+          ];
+ 
+          if (e.COMMIT_MSG) {
+            blocks.push({
+              type: "context",
+              elements: [{ type: "mrkdwn", text: `:speech_balloon: ${esc(cut(e.COMMIT_MSG, 150))}` }],
+            });
+          }
+ 
+          const projects = Object.entries(byProject).sort(([a], [b]) => a.localeCompare(b));
+          if (projects.length > 1) {
+            const lines = projects.map(
+              ([p, v]) => `• *${esc(p)}*: ✅ ${v.passed}  ❌ ${v.failed}  ⚠️ ${v.flaky}  ⏭ ${v.skipped}`
+            );
+            blocks.push({ type: "section", text: { type: "mrkdwn", text: "*By browser/project:*\n" + lines.join("\n") } });
+          }
+ 
+          if (failed.length) {
+            const lines = failed
+              .slice(0, 6)
+              .map(([n, m, r]) => `• \`${esc(cut(n, 100))}\` _(retries: ${r})_\n    ${esc(cut(m, 160))}`);
+            const extra = failed.length > 6 ? `\n…та ще ${failed.length - 6}` : "";
+            blocks.push({ type: "section", text: { type: "mrkdwn", text: "*:x: Failed tests:*\n" + lines.join("\n") + extra } });
+          }
+ 
+          if (flaky.length) {
+            const lines = flaky.slice(0, 5).map(([n, r]) => `• \`${esc(cut(n, 100))}\` _(passed after ${r} retry)_`);
+            const extra = flaky.length > 5 ? `\n…та ще ${flaky.length - 5}` : "";
+            blocks.push({ type: "section", text: { type: "mrkdwn", text: "*:warning: Flaky tests:*\n" + lines.join("\n") + extra } });
+          }
+ 
+          slow.sort((a, b) => b[0] - a[0]);
+          if (slow.length) {
+            const lines = slow.slice(0, 3).map(([d, n]) => `• \`${esc(cut(n, 80))}\` — ${(d / 1000).toFixed(1)}s`);
+            blocks.push({ type: "section", text: { type: "mrkdwn", text: "*:snail: Slowest tests:*\n" + lines.join("\n") } });
+          }
+ 
+          blocks.push({
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: { type: "plain_text", text: "Open run (HTML report & traces)" },
+                url: e.RUN_URL,
+                style: ok ? "primary" : "danger",
+              },
+            ],
+          });
+ 
+          const payload = {
+            text: `Playwright ${status}: ${e.REPO}`,
+            attachments: [{ color, blocks }],
+          };
+          fs.writeFileSync("reports/slack_payload.json", JSON.stringify(payload));
+ 
+          // ---------- GitHub Step Summary ----------
+          const md = [
+            `## ${icon} Playwright report — ${status}`,
+            "",
+            "| Passed | Failed | Flaky | Skipped | Total | Pass rate | Duration |",
+            "|:--:|:--:|:--:|:--:|:--:|:--:|:--:|",
+            `| ${passed} | ${nFailed} | ${nFlaky} | ${nSkipped} | ${total} | ${rate.toFixed(1)}% | ${durText} |`,
+          ];
+          if (projects.length) {
+            md.push("", "### By project", "| Project | Passed | Failed | Flaky | Skipped |", "|---|:--:|:--:|:--:|:--:|");
+            for (const [p, v] of projects) md.push(`| ${p} | ${v.passed} | ${v.failed} | ${v.flaky} | ${v.skipped} |`);
+          }
+          if (failed.length) {
+            md.push("", "### Failed tests");
+            for (const [n, m] of failed) md.push(`- \`${n}\` — ${cut(m, 250)}`);
+          }
+          if (flaky.length) {
+            md.push("", "### Flaky tests");
+            for (const [n] of flaky) md.push(`- \`${n}\``);
+          }
+          if (slow.length) {
+            md.push("", "### Slowest tests", "| Test | Time |", "|---|--:|");
+            for (const [d, n] of slow.slice(0, 10)) md.push(`| \`${n}\` | ${(d / 1000).toFixed(1)}s |`);
+          }
+          fs.appendFileSync(e.GITHUB_STEP_SUMMARY, md.join("\n") + "\n");
+          fs.appendFileSync(e.GITHUB_OUTPUT, `failed=${nFailed}\nflaky=${nFlaky}\ntotal=${total}\n`);
+          JS
+ 
+      # ---------- Артефакти ----------
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+ 
+      - name: Upload traces, screenshots, videos & raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            test-results/
+            reports/
+          retention-days: 14
+ 
+      # ---------- Slack ----------
+      - name: Send report to Slack
+        if: always() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -sS -X POST \
+            -H 'Content-type: application/json' \
+            --data @reports/slack_payload.json \
+            "$SLACK_WEBHOOK_URL"
+ 
+      # ---------- Фінальний статус job ----------
+      - name: Fail job if tests failed
+        if: steps.pw.outcome == 'failure'
+        run: |
+          echo "Failed: ${{ steps.report.outputs.failed }} of ${{ steps.report.outputs.total }}"
+          exit 1

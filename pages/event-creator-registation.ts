@@ -1,4 +1,4 @@
-import { RegistrationPage } from './registration';
+import { RegistrationPage } from './user-registration';
 
 export class SignupPage extends RegistrationPage {
     override readonly passwordRepeatField = this.page.locator('#confirmPassword');
